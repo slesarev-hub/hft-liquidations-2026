@@ -29,14 +29,18 @@ TRD = {"btc": str(BASE / "binance_trades/perp_btcusdt.parquet"),
        "eth": str(BASE / "binance_trades/perp_ethusdt.parquet")}
 BBO = {"btc": str(BASE / "binance_booktickers/perp_btcusdt.parquet"),
        "eth": str(BASE / "binance_booktickers/perp_ethusdt.parquet")}
+LIQ_B = {"btc": str(BASE / "binance_liquidations/perp_btcusdt.parquet"),
+         "eth": str(BASE / "binance_liquidations/perp_ethusdt.parquet")}
+LIQ_Y = {"btc": str(BASE / "bybit_liquidations/btcusdt.parquet"),
+         "eth": str(BASE / "bybit_liquidations/ethusdt.parquet")}
 
 TAUS = (30, 120, 300)
 US = 1_000_000
+BYBIT_LAG_US = 200_000          # Bybit events visible +200ms after their timestamp
+LIQ_LOOKBACK_US = 600 * US      # warm-up buffer before slice start for EWMA/windows
 
-# Candidate features. prior = expected sign of corr(feature, pnl).
-# "same-side" pressure features are expected NEGATIVELY related to maker pnl
-# (more continuation in the taker direction => worse fill).
-FEATURES = [
+# Microstructure features (variant 1). prior = naive expected sign of corr(feature, pnl).
+FEATURES_MICRO = [
     ("flow_same_30s",   "signed taker flow same-side, 30s (OFI)",       -1),
     ("flow_same_5s",    "signed taker flow same-side, 5s (OFI)",        -1),
     ("flow_imb_30s",    "taker flow imbalance same-side, 30s",          -1),
@@ -47,6 +51,16 @@ FEATURES = [
     ("spread_bps",      "BBO spread (bps), direction-agnostic",         -1),
     ("mid_vel_5s_same", "mid velocity 5s same-side (bps) [reference]",  -1),
 ]
+# Liquidation-cascade features (variant 3). signed by liq side (+buy=upward),
+# then direction-relativized by the taker side s (same-side = taker direction).
+FEATURES_LIQ = [
+    ("liq_bin_same_30s", "binance liq EWMA same-side, hl=30s",          -1),
+    ("liq_bin_same_5s",  "binance liq EWMA same-side, hl=5s",           -1),
+    ("liq_byb_same_30s", "bybit liq EWMA same-side, hl=30s (+200ms)",   -1),
+    ("liq_all_same_30s", "binance+bybit liq EWMA same-side, hl=30s",    -1),
+    ("liq_cnt_30s",      "liq event count (both venues), 30s",          -1),
+]
+FEATURES = FEATURES_MICRO + FEATURES_LIQ
 
 
 def to_us(date_str: str) -> int:
@@ -72,6 +86,64 @@ def weighted_ic(feat, pnl, w, kind="spearman"):
     vf = np.sum(ww * (f - fm) ** 2)
     vp = np.sum(ww * (p - pm) ** 2)
     return cov / np.sqrt(vf * vp) if vf > 0 and vp > 0 else np.nan
+
+
+def ewma_at(query_ts, ev_ts, ev_val, halflife_us):
+    """Causal EWMA of an event stream evaluated at query_ts (events strictly before).
+    Iterative per-event (events are sparse) then decayed to each query time.
+    Numerically stable (no exp(t/H) overflow)."""
+    n = len(ev_ts)
+    out = np.zeros(len(query_ts))
+    if n == 0:
+        return out
+    post = np.empty(n)
+    e = 0.0
+    last = ev_ts[0]
+    for i in range(n):
+        e = e * 2.0 ** (-(ev_ts[i] - last) / halflife_us) + ev_val[i]
+        post[i] = e
+        last = ev_ts[i]
+    idx = np.searchsorted(ev_ts, query_ts, side="left") - 1
+    ok = idx >= 0
+    out[ok] = post[idx[ok]] * 2.0 ** (-(query_ts[ok] - ev_ts[idx[ok]]) / halflife_us)
+    return out
+
+
+def load_liq(con, sym, t0, t1):
+    """Load binance + bybit liquidation events (sorted), bybit shifted +200ms.
+    sign: buy=+1 (upward pressure), sell=-1. Returns (ts, sign*notional, notional)."""
+    def fetch(path, shift):
+        a = con.execute(f"""
+            SELECT timestamp + {shift} AS ts,
+                   CASE WHEN side='buy' THEN 1.0 ELSE -1.0 END AS sgn,
+                   price*amount AS notl
+            FROM read_parquet('{path}')
+            WHERE timestamp BETWEEN {t0 - LIQ_LOOKBACK_US - shift} AND {t1}
+            ORDER BY ts
+        """).fetchnumpy()
+        ts = np.asarray(a["ts"], dtype=np.int64)
+        sg = np.asarray(a["sgn"], dtype=np.float64)
+        nt = np.asarray(a["notl"], dtype=np.float64)
+        return ts, sg, nt
+    return fetch(LIQ_B[sym], 0), fetch(LIQ_Y[sym], BYBIT_LAG_US)
+
+
+def add_liq_features(con, sym, t0, t1, df):
+    (bts, bsg, bnt), (yts, ysg, ynt) = load_liq(con, sym, t0, t1)
+    tq = df["ts"].to_numpy(np.int64)
+    s = df["s"].to_numpy(float)
+    bin_30 = ewma_at(tq, bts, bsg * bnt, 30 * US)
+    bin_5 = ewma_at(tq, bts, bsg * bnt, 5 * US)
+    byb_30 = ewma_at(tq, yts, ysg * ynt, 30 * US)
+    df["liq_bin_same_30s"] = s * bin_30
+    df["liq_bin_same_5s"] = s * bin_5
+    df["liq_byb_same_30s"] = s * byb_30
+    df["liq_all_same_30s"] = s * (bin_30 + byb_30)
+    # event-count intensity (direction-agnostic): both venues in [t-30s, t)
+    all_ts = np.sort(np.concatenate([bts, yts]))
+    cnt = np.searchsorted(all_ts, tq, "left") - np.searchsorted(all_ts, tq - 30 * US, "left")
+    df["liq_cnt_30s"] = cnt.astype(float)
+    return df
 
 
 def build_sample(con, sym, t0, t1, n_sample, seed):
@@ -177,6 +249,7 @@ def add_book_and_markout(con, sym, t0, t1, df):
 
 def build_scored(con, sym, t0, t1, n_sample, seed):
     df = build_sample(con, sym, t0, t1, n_sample, seed)
+    df = add_liq_features(con, sym, t0, t1, df)
     df = add_book_and_markout(con, sym, t0, t1, df)
     return df
 
@@ -199,23 +272,23 @@ def ic_table(df, t0, t1):
     return pd.DataFrame(rows)
 
 
-def fit_factor(df):
+def fit_factor(df, feats=FEATURES):
     """Per-feature z-norm params (mu,sd) and per-tau IC weights, fit on TRAIN."""
     zp = {}
-    for name, _, _ in FEATURES:
+    for name, _, _ in feats:
         f = df[name].to_numpy().astype(float)
         zp[name] = (np.nanmean(f), np.nanstd(f))
     wt = {}
     for tau in TAUS:
         pnl = df[f"pnl_{tau}"].to_numpy(); w = df["w"].to_numpy()
         wt[tau] = {name: weighted_ic(df[name].to_numpy().astype(float), pnl, w)
-                   for name, _, _ in FEATURES}
+                   for name, _, _ in feats}
     return zp, wt
 
 
-def factor_score(df, zp, weights_tau):
+def factor_score(df, zp, weights_tau, feats=FEATURES):
     score = np.zeros(len(df))
-    for name, _, _ in FEATURES:
+    for name, _, _ in feats:
         mu, sd = zp[name]
         f = df[name].to_numpy().astype(float)
         z = np.nan_to_num((f - mu) / sd if sd > 0 else f * 0.0, nan=0.0)
@@ -261,9 +334,12 @@ def run_symbol(con, sym, tr, va, n_sample, seed, out_dir):
     print(ic.to_string(index=False))
     ic.to_csv(out_dir / f"ic_{sym}.csv", index=False)
 
-    zp, wt = fit_factor(train)
+    sets = {"micro": FEATURES_MICRO, "micro+liq": FEATURES}
+    fits = {nm: fit_factor(train, fs) for nm, fs in sets.items()}
     print("\n--- Exp2: Score(keep-rate), factor fit on TRAIN ---")
-    report_curve("TRAIN(in-sample)", train, factor_score(train, zp, wt[120]), tr_days)
+    for nm, fs in sets.items():
+        zp, wt = fits[nm]
+        report_curve(f"TRAIN {nm}", train, factor_score(train, zp, wt[120], fs), tr_days)
 
     if va is not None:
         v0, v1 = va
@@ -271,7 +347,10 @@ def run_symbol(con, sym, tr, va, n_sample, seed, out_dir):
         val = build_scored(con, sym, v0, v1, n_sample, seed)
         print(f"\nval rows={len(val):,}  valid pnl_30={np.isfinite(val['pnl_30']).sum():,}")
         print("--- Exp2 FAIR: train-fit factor applied to VALIDATION (Feb) ---")
-        report_curve("VAL(out-of-sample)", val, factor_score(val, zp, wt[120]), va_days)
+        print("    (compare micro vs micro+liq: does the liq cascade add to flow?)")
+        for nm, fs in sets.items():
+            zp, wt = fits[nm]
+            report_curve(f"VAL {nm}", val, factor_score(val, zp, wt[120], fs), va_days)
 
 
 def main():
